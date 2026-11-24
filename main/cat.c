@@ -691,8 +691,16 @@ static void poll_loop(cdc_acm_dev_hdl_t dev)
     cat_tx(dev, "AI1;");
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    // Request initial states asynchronously (rx_cb parses answers as they arrive)
-    cat_tx(dev, "FA;FB;MD0;MD1;AG0;AG1;SQ0;SQ1;RI0;RM0;BP00;BP01;BP10;BP11;");
+    // Request initial states in small batches with short delays to prevent radio buffer overflows
+    cat_tx(dev, "FA;FB;");
+    vTaskDelay(pdMS_TO_TICKS(40));
+    cat_tx(dev, "MD0;MD1;");
+    vTaskDelay(pdMS_TO_TICKS(40));
+    cat_tx(dev, "AG0;AG1;SQ0;SQ1;");
+    vTaskDelay(pdMS_TO_TICKS(40));
+    cat_tx(dev, "RI0;RM0;");
+    vTaskDelay(pdMS_TO_TICKS(40));
+    cat_tx(dev, "BP00;BP01;BP10;BP11;");
 
     while (!s_disconnected) {
         // 1. Process any pending commands in the queue (already checked against the allow-list when queued)
@@ -728,11 +736,26 @@ static void poll_loop(cdc_acm_dev_hdl_t dev)
         // 3. Poll RI0; every 500ms (every 5 iterations)
         if ((poll_count % 5) == 0) {
             cat_tx(dev, "RI0;");
+
+            // 3b. If essential states (freq or mode of MAIN/SUB) are still missing, retry immediately
+            bool missing_essential = false;
+            if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(10)) == pdTRUE) {
+                missing_essential = (s_state.freq_main == 0 || s_state.freq_sub == 0 ||
+                                     s_state.mode_main_raw == 0 || s_state.mode_sub_raw == 0);
+                xSemaphoreGive(s_lock);
+            }
+            if (missing_essential) {
+                cat_tx(dev, "FA;FB;MD0;MD1;");
+            }
         }
 
-        // 4. Periodic slow refresh / sync every 5 seconds (50 iterations)
+        // 4. Periodic slow refresh / sync every 5 seconds (staggered to avoid flooding the radio)
         if ((poll_count % 50) == 0) {
-            cat_tx(dev, "AI1;FA;FB;MD0;MD1;AG0;AG1;SQ0;SQ1;BP00;BP01;BP10;BP11;");
+            cat_tx(dev, "AI1;FA;FB;MD0;MD1;");
+        } else if ((poll_count % 50) == 10) {
+            cat_tx(dev, "AG0;AG1;SQ0;SQ1;");
+        } else if ((poll_count % 50) == 20) {
+            cat_tx(dev, "BP00;BP01;BP10;BP11;");
         }
         poll_count++;
 
