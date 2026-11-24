@@ -356,6 +356,30 @@ Enter Host name without ".local" [Current: ftx-1c] (a-z, 0-9, '-'; DEFAULT to re
 
 ## Usage
 
+### Web UI (Browser Console)
+
+Opening `https://ftx-1c.local/` in your browser provides a full-featured transceiver console:
+
+- **Dual VFO Displays & Controls**:
+  - **MAIN (VFO-A)**: Highlighted in sky blue. Mapped to the L-channel audio (left ear).
+  - **SUB (VFO-B)**: Highlighted in mint green. Mapped to the R-channel audio (right ear).
+  - **Band & Mode Switching**: Instant single-click selection across 160m–70cm bands and standard amateur modes (LSB, USB, CW, AM, FM, DATA-L, DATA-U, DATA-F, RTTY, PSK, C4FM).
+  - **Tuning Dial & Step Controls**: Smooth frequency adjustment via mouse drag, wheel scrolling, and step buttons (◀ / ▶).
+  - **VFO Swap / Copy**: `A⇄B` (swap), `A→B`, and `B→A` helper buttons.
+- **Spectrum Scope & Waterfall**:
+  - Real-time audio FFT visualization. Automatically selects the optimal SPAN per mode (CW: 1 kHz, AM/FM: 6 kHz, SSB/DATA: 3.5 kHz) with manual override (1k / 2.5k / 3.5k / 6k).
+- **Pseudo Squelch**:
+  - Variance-based detection for AM and level-based detection for FM/SSB, with independent L/R channel gating.
+- **FT8 Real-Time Decoder & Live World Map**:
+  - In-browser decoding via Web Worker on every 15-second slot.
+  - Clicking `DECODER ON` opens a separate live world map window (`/map`), plotting decoded grid locators in real time.
+- **Audio Recording (REC)**:
+  - `REC MAIN` / `REC SUB` buttons save recent received audio directly as WAV files in the browser.
+- **Power & System Controls**:
+  - **POWER / PLAY**: Start/stop the HTTPS audio stream.
+  - **REBOOT**: Remotely reboot the ESP32-S3 microcontroller cleanly.
+  - **RIG OFF**: Turn off the FTX-1 transceiver hardware over CAT (with confirmation prompt).
+
 ### Endpoints
 
 All of them require Basic authentication (see "Security notes" below).
