@@ -602,6 +602,7 @@ So that the radio cannot be put into transmit over the network, the CAT commands
 - `ftx-1c.local` does not open: check that it is on the same LAN / subnet, and try opening the IP address from the log directly.
 - The browser refuses the connection: check that you opened `https://`, not `http://`.
 - The device is not recognized: it may not be UAC 1.0, or a hub may not supply enough power.
+- The CAT connection starts about 3 seconds after the FTX-1's USB device appears. This wait is intentional: nothing is sent to the radio while it is still starting up. Then the firmware asks `ID;` once at each CAT-1 RATE, in this order: the rate that worked last time, 115200, 38400 (the radio's factory setting), 19200, 9600, 4800. You do not have to set the rate in this firmware. If no rate gets an answer (`ID` + 4 digits), it tries again every 5 seconds. Check the `cat` lines in the serial log: they show the rate found, every command sent at start-up (`TX`), the radio's answers (`RX`), and any `?;` (the radio's error answer).
 - The scope (waterfall) does not match the frequency shown for VFO A / VFO B: this rarely happens. Please be kind to the rig and press the **A→B (A=B)** button to set the frequencies again.
 
 ## Source layout
