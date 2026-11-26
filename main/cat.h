@@ -50,7 +50,9 @@ typedef struct {
 /**
  * @brief Start the CAT client. Requires usb_audio_init() (it installs the USB Host Library) first.
  *
- * When the CP210x serial port is attached, it is opened at 38400 bps 8N1 and polled.
+ * When the CP210x serial port is attached, it is opened 8N1 and the radio is asked "ID;". The CAT-1 RATE is
+ * found by trying the rate that worked last time, 115200, 38400 (the radio's factory setting), 19200, 9600 and 4800;
+ * the radio is then read step by step and polled.
  */
 esp_err_t cat_init(void);
 

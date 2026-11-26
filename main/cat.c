@@ -11,7 +11,8 @@
  *
  *   Command         Dir    Meaning (as used here)
  *   --------------  -----  ------------------------------------------------------------------
- *   ID;             read   identify; the port that answers is used as the CAT port
+ *   ID;             read   identify; the port that answers is used as the CAT port. Answer: ID + 4 digits
+ *   AI;             read   auto information state. Answer: AI0 / AI1 (the radio turns it OFF at power off)
  *   AI1;            set    auto information ON (the radio pushes changes by itself)
  *   FA; FB;         read   frequency of MAIN (FA) / SUB (FB). Answer: FA/FB + up to 10 digits, in Hz
  *   FAnnnnnnnnn;    set    frequency in Hz, 9 digits, 30000 - 470000000 (FB for SUB)
@@ -58,14 +59,20 @@
 // The FTX-1 exposes two CP210x UARTs (Silicon Labs VID 0x10C4). Both have the same VID/PID, so they are
 // opened by USB device address. Whichever answers "ID;" at CAT_BAUD is used as the CAT port.
 #define SILABS_VID          0x10C4
-#define CAT_BAUD            115200   // CAT-1 RATE of this radio
+#define CAT_BAUD            115200   // tried first on a fresh start; the radio's factory CAT-1 RATE is 38400,
+                                     // which is tried next (see baud_candidates())
 #define CAT_TASK_PRIORITY   4
 #define POLL_PERIOD_MS      100
 #define ANSWER_TIMEOUT_MS   300
 #define TX_TIMEOUT_MS       200
 #define RX_BUF_BYTES        64
 #define MAX_FAILS           10       // consecutive missing answers before the port is dropped
-#define SCAN_PERIOD_MS      2000
+#define SCAN_PERIOD_MS      2000     // between scans while no USB device is on the bus
+#define SCAN_PERIOD_FAIL_MS 5000     // between scans when a device was tried but did not answer ID;
+#define CAT_SETTLE_MS       3000     // wait after a USB device appears before the first byte is sent
+                                     // (the manual gives no start-up time; value found by experiment)
+#define EX_DELAY_AFTER_INIT_US 2000000LL // USB OUT LEVEL is written this long after the initial reads
+#define CAT_ID_ANSWER_LEN   7        // "ID" + 4 digits + ";" (the manual lists 0800; the value is only logged)
 
 // CP210x vendor requests (Silicon Labs AN571)
 #define CP210X_REQ_OUT      (USB_BM_REQUEST_TYPE_TYPE_VENDOR | USB_BM_REQUEST_TYPE_RECIP_INTERFACE | USB_BM_REQUEST_TYPE_DIR_OUT)
@@ -87,6 +94,13 @@ static int64_t s_last_set_notch_us[2];       // [MAIN, SUB]: last local BP write
 static int64_t s_last_set_main_vol_us;
 static int64_t s_last_set_sub_vol_us;
 static QueueHandle_t s_cmd_queue;      // queued commands to send over CAT
+static volatile uint32_t s_err_count;  // "?;" answers received from the radio (diagnostics)
+static volatile bool s_ai_off;         // the radio answered AI0: auto information must be switched on again
+static bool s_sq_read_rejected;        // the radio answered "?;" to SQ0; / SQ1; at start-up: do not poll them
+static uint32_t s_last_baud;           // baud rate at which ID; was last answered (tried first next time)
+static int64_t s_dev_seen_us;          // when a USB device was first seen in this scan series, 0 = none
+static bool s_tried_ports;             // the last scan opened a device but nothing answered ID;
+static volatile bool s_log_io;                  // log every TX / RX string (start-up only, to keep the log short)
 
 typedef struct {
     char cmd[32];
@@ -161,6 +175,9 @@ static bool rx_cb(const uint8_t *data, size_t len, void *arg)
         s_rx[s_rx_len++] = c;
         if (c == ';') {
             s_rx[s_rx_len] = '\0';
+            if (s_log_io) {
+                ESP_LOGI(TAG, "RX %s", s_rx);
+            }
             memcpy(s_answer, s_rx, s_rx_len + 1);
             handle_cat_packet(s_rx);
             s_rx_len = 0;
@@ -252,8 +269,8 @@ static bool cat_cmd_allowed(const char *c, size_t len)
     case CAT_TWO('A', 'B'):         // copy MAIN to SUB
     case CAT_TWO('B', 'A'):         // copy SUB to MAIN
         return pl == 0;
-    case CAT_TWO('A', 'I'):         // auto information ON
-        return pl == 1 && p[0] == '1';
+    case CAT_TWO('A', 'I'):         // auto information: read, or set ON
+        return pl == 0 || (pl == 1 && p[0] == '1');
     case CAT_TWO('R', 'I'):         // radio information (read)
         return pl == 1 && p[0] == '0';
     case CAT_TWO('R', 'M'):         // meter (read): 0 = S meter
@@ -335,6 +352,9 @@ static esp_err_t cat_tx(cdc_acm_dev_hdl_t dev, const char *cmds)
     if (!cat_cmds_allowed(cmds, CAT_TX_MAX_CMDS)) {
         ESP_LOGE(TAG, "Blocked a CAT command that is not on the allow-list");
         return ESP_ERR_INVALID_ARG;
+    }
+    if (s_log_io) {
+        ESP_LOGI(TAG, "TX %s", cmds);
     }
     return cdc_acm_host_data_tx_blocking(dev, (const uint8_t *)cmds, strlen(cmds), TX_TIMEOUT_MS);
 }
@@ -530,6 +550,17 @@ static void handle_cat_packet(const char *pkt)
     if (!pkt || pkt[0] == '\0' || !s_lock) {
         return;
     }
+    if (strcmp(pkt, "AI0;") == 0 || strcmp(pkt, "AI1;") == 0) {
+        s_ai_off = pkt[2] == '0';      // answer to AI; (also sent by the radio itself)
+        return;
+    }
+    if (strcmp(pkt, "?;") == 0) {
+        // Format error or command not executable (CAT manual, "Error message"); the counter is read by query()
+        if (++s_err_count <= 20) {
+            ESP_LOGW(TAG, "Radio answered ?; (%lu so far)", (unsigned long)s_err_count);
+        }
+        return;
+    }
 
     uint32_t f = 0;
     if (parse_freq(pkt, "FA", &f)) {
@@ -681,26 +712,75 @@ static bool data_usb_active(void)
     return active;
 }
 
+#define INIT_GAP_MS 20      // pause between two start-up reads
+
+/** One start-up read: send one command, wait for its answer, log what happened. The answer itself is
+ *  handled by handle_cat_packet() in rx_cb(). */
+static bool init_read(cdc_acm_dev_hdl_t dev, const char *cmd)
+{
+    char a[RX_BUF_BYTES];
+    const uint32_t err_before = s_err_count;
+    const int64_t t0 = esp_timer_get_time();
+    const bool ok = query(dev, cmd, a, sizeof(a));
+    if (!ok) {
+        ESP_LOGW(TAG, "init: %s no answer after %lld ms (%s)", cmd, (long long)((esp_timer_get_time() - t0) / 1000),
+                 s_err_count != err_before ? "radio answered ?;" : "timeout");
+    }
+    vTaskDelay(pdMS_TO_TICKS(INIT_GAP_MS));
+    return ok;
+}
+
+/** Staged start-up: read one value at a time and wait for each answer before sending the next command.
+ *  A command that fails is logged and skipped; it does not stop the sequence. */
+static void init_sequence(cdc_acm_dev_hdl_t dev)
+{
+    // Stage 1: frequency and mode, the values the UI needs first
+    init_read(dev, "FA;");
+    init_read(dev, "FB;");
+    init_read(dev, "MD0;");
+    init_read(dev, "MD1;");
+
+    // Stage 2: auto information. The radio switches it OFF at power off (CAT manual), so read it and
+    // set it only when it is not ON. If the read fails, set it anyway (the previous behaviour).
+    char a[RX_BUF_BYTES];
+    const bool ai_read = query(dev, "AI;", a, sizeof(a));
+    if (!ai_read || a[2] != '1') {
+        ESP_LOGI(TAG, "init: AI is %s, sending AI1;", ai_read ? "OFF" : "unknown");
+        cat_tx(dev, "AI1;");
+    }
+    s_ai_off = false;
+    vTaskDelay(pdMS_TO_TICKS(INIT_GAP_MS));
+
+    // Stage 3: the rest. SQ0; / SQ1; do not match the manual's read form "SQ;" (undocumented here), so if the
+    // radio answers ?; to one of them, they are not polled again in this session.
+    s_sq_read_rejected = false;
+    init_read(dev, "AG0;");
+    init_read(dev, "AG1;");
+    const char *const sq[] = {"SQ0;", "SQ1;"};
+    for (size_t i = 0; i < 2 && !s_sq_read_rejected; i++) {
+        const uint32_t err_before = s_err_count;
+        if (!init_read(dev, sq[i]) && s_err_count != err_before) {
+            s_sq_read_rejected = true;
+            ESP_LOGW(TAG, "init: SQ read form rejected by the radio, SQ is not polled");
+        }
+    }
+    init_read(dev, "RI0;");
+    init_read(dev, "RM0;");
+    init_read(dev, "BP00;");
+    init_read(dev, "BP01;");
+    init_read(dev, "BP10;");
+    init_read(dev, "BP11;");
+}
+
 static void poll_loop(cdc_acm_dev_hdl_t dev)
 {
     uint32_t poll_count = 0;
     bool usb_level_applied = false;   // DATA USB OUT LEVEL already set for the current DATA-USB session
 
-    // Enable Auto Information (AI1;) so FTX-1 pushes state changes automatically
-    ESP_LOGI(TAG, "Enabling CAT Auto Information (AI1;)");
-    cat_tx(dev, "AI1;");
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    // Request initial states in small batches with short delays to prevent radio buffer overflows
-    cat_tx(dev, "FA;FB;");
-    vTaskDelay(pdMS_TO_TICKS(40));
-    cat_tx(dev, "MD0;MD1;");
-    vTaskDelay(pdMS_TO_TICKS(40));
-    cat_tx(dev, "AG0;AG1;SQ0;SQ1;");
-    vTaskDelay(pdMS_TO_TICKS(40));
-    cat_tx(dev, "RI0;RM0;");
-    vTaskDelay(pdMS_TO_TICKS(40));
-    cat_tx(dev, "BP00;BP01;BP10;BP11;");
+    init_sequence(dev);
+    const int64_t init_done_us = esp_timer_get_time();
+    s_log_io = false;                 // start-up is logged in full; later traffic only on errors
+    ESP_LOGI(TAG, "init done, errors so far: %lu", (unsigned long)s_err_count);
 
     while (!s_disconnected) {
         // 1. Process any pending commands in the queue (already checked against the allow-list when queued)
@@ -719,8 +799,9 @@ static void poll_loop(cdc_acm_dev_hdl_t dev)
 
         // 1b. Entering DATA-USB (from the web UI or the radio itself): set the USB OUT LEVEL once.
         //     Leaving DATA-USB re-arms it, so a level changed by hand stays until the next entry.
+        //     Right after start-up it waits EX_DELAY_AFTER_INIT_US, so no menu write is sent while the radio is booting.
         if (data_usb_active()) {
-            if (!usb_level_applied) {
+            if (!usb_level_applied && (esp_timer_get_time() - init_done_us) >= EX_DELAY_AFTER_INIT_US) {
                 char cmd[16];
                 snprintf(cmd, sizeof(cmd), "EX" EX_USB_OUT_DATA "%03u;", (unsigned)DATA_USB_OUT_LEVEL);
                 ESP_LOGI(TAG, "DATA-USB: setting USB OUT LEVEL to %u", (unsigned)DATA_USB_OUT_LEVEL);
@@ -749,11 +830,20 @@ static void poll_loop(cdc_acm_dev_hdl_t dev)
             }
         }
 
-        // 4. Periodic slow refresh / sync every 5 seconds (staggered to avoid flooding the radio)
-        if ((poll_count % 50) == 0) {
-            cat_tx(dev, "AI1;FA;FB;MD0;MD1;");
+        // 4. Periodic slow refresh / sync every 5 seconds (staggered to avoid flooding the radio).
+        //    Not on the first pass: init_sequence() has just read all of this.
+        //    AI is only read; it is set again when the radio reports it OFF.
+        if (s_ai_off) {
+            s_ai_off = false;
+            ESP_LOGI(TAG, "AI reported OFF, sending AI1;");
+            cat_tx(dev, "AI1;");
+        }
+        if (poll_count == 0) {
+            // nothing: start-up reads are done
+        } else if ((poll_count % 50) == 0) {
+            cat_tx(dev, "AI;FA;FB;MD0;MD1;");
         } else if ((poll_count % 50) == 10) {
-            cat_tx(dev, "AG0;AG1;SQ0;SQ1;");
+            cat_tx(dev, s_sq_read_rejected ? "AG0;AG1;" : "AG0;AG1;SQ0;SQ1;");
         } else if ((poll_count % 50) == 20) {
             cat_tx(dev, "BP00;BP01;BP10;BP11;");
         }
@@ -782,6 +872,30 @@ static esp_err_t cp210x_setup(cdc_acm_dev_hdl_t dev, uint8_t intf, uint32_t baud
     return cdc_acm_host_send_custom_request(dev, CP210X_REQ_OUT, CP210X_SET_MHS, CP210X_MHS_DTR_RTS_LOW, intf, 0, NULL);
 }
 
+/** "ID" + 4 digits + ";" */
+static bool is_id_answer(const char *a)
+{
+    return strlen(a) == CAT_ID_ANSWER_LEN && a[0] == 'I' && a[1] == 'D' && all_digits(a + 2, 4) && a[6] == ';';
+}
+
+/** Rates to try, in order: the rate that worked last time, CAT_BAUD, then the other rates the radio offers
+ *  (CAT manual: 4800 / 9600 / 19200 / 38400 / 115200; 38400 is the factory setting). Returns the count. */
+static size_t baud_candidates(uint32_t out[5])
+{
+    const uint32_t base[] = {s_last_baud, CAT_BAUD, 38400, 19200, 9600, 4800};
+    size_t n = 0;
+    for (size_t i = 0; i < sizeof(base) / sizeof(base[0]); i++) {
+        bool dup = base[i] == 0;
+        for (size_t j = 0; j < n; j++) {
+            dup = dup || out[j] == base[i];
+        }
+        if (!dup) {
+            out[n++] = base[i];
+        }
+    }
+    return n;
+}
+
 /** Open the CP210x at USB address addr and return true if it answers ID; as a CAT port */
 static bool try_port(uint8_t addr, cdc_acm_dev_hdl_t *dev, uint8_t *opened)
 {
@@ -805,9 +919,9 @@ static bool try_port(uint8_t addr, cdc_acm_dev_hdl_t *dev, uint8_t *opened)
     (*opened)++;
     // The CP210x UARTs here are single-interface devices (the CDC driver opened interface 0)
     const uint8_t intf = cfg.interface_idx;
-    // CAT_BAUD first (the configured CAT-1 rate), then the other rates the radio offers
-    static const uint32_t bauds[] = {CAT_BAUD, 38400, 4800, 9600, 19200};
-    for (size_t b = 0; b < sizeof(bauds) / sizeof(bauds[0]); b++) {
+    uint32_t bauds[5];
+    const size_t n_bauds = baud_candidates(bauds);
+    for (size_t b = 0; b < n_bauds; b++) {
         err = cp210x_setup(*dev, intf, bauds[b]);
         if (err != ESP_OK) {
             diag("setup addr %u: %s", addr, esp_err_to_name(err));
@@ -818,15 +932,20 @@ static bool try_port(uint8_t addr, cdc_acm_dev_hdl_t *dev, uint8_t *opened)
         s_rx_bytes = 0;
         memset(s_rx_tail, ' ', sizeof(s_rx_tail) - 1);
         s_rx_tail[sizeof(s_rx_tail) - 1] = '\0';
-        for (int i = 0; i < 2; i++) {
-            if (query(*dev, "ID;", a, sizeof(a))) {
-                ESP_LOGI(TAG, "CAT port at USB address %u, interface %u, %lu bps: %s", addr, intf,
-                         (unsigned long)bauds[b], a);
-                return true;
+        // One ID; per rate: a wrong rate only makes the radio see garbage, so it is not repeated
+        const int64_t t0 = esp_timer_get_time();
+        s_log_io = true;
+        if (query(*dev, "ID;", a, sizeof(a)) && is_id_answer(a)) {
+            s_last_baud = bauds[b];
+            ESP_LOGI(TAG, "CAT port at USB address %u, interface %u, %lu bps: %s (answered in %lld ms)", addr, intf,
+                     (unsigned long)bauds[b], a, (long long)((esp_timer_get_time() - t0) / 1000));
+            if (strcmp(a, "ID0800;") != 0) {
+                ESP_LOGW(TAG, "ID answer is not the FTX-1 value ID0800; of the CAT manual");
             }
+            return true;
         }
-        ESP_LOGI(TAG, "addr %u @%lu: no ID; answer (%lu bytes received)", addr, (unsigned long)bauds[b],
-                 (unsigned long)s_rx_bytes);
+        ESP_LOGI(TAG, "addr %u @%lu: no ID; answer (%lu bytes received, %lu x ?; so far)", addr,
+                 (unsigned long)bauds[b], (unsigned long)s_rx_bytes, (unsigned long)s_err_count);
         diag("addr %u: no answer, rx %lu B [%s]", addr, (unsigned long)s_rx_bytes, s_rx_tail);
     }
     cdc_acm_host_close(*dev);
@@ -838,8 +957,30 @@ static cdc_acm_dev_hdl_t find_cat_port(void)
 {
     uint8_t addrs[10];
     int count = 0;
+    s_tried_ports = false;
     if (usb_host_device_addr_list_fill(sizeof(addrs), addrs, &count) != ESP_OK) {
         return NULL;
+    }
+    if (count == 0) {
+        s_dev_seen_us = 0;
+    } else {
+        // The radio may still be starting up when its USB device appears: send nothing for CAT_SETTLE_MS
+        const int64_t now_us = esp_timer_get_time();
+        if (s_dev_seen_us == 0) {
+            s_dev_seen_us = now_us;
+            ESP_LOGI(TAG, "USB device seen (%d on the bus), waiting %d ms before the first CAT byte", count,
+                     CAT_SETTLE_MS);
+        }
+        const int64_t wait_ms = CAT_SETTLE_MS - (now_us - s_dev_seen_us) / 1000;
+        if (wait_ms > 0) {
+            vTaskDelay(pdMS_TO_TICKS(wait_ms));
+            if (usb_host_device_addr_list_fill(sizeof(addrs), addrs, &count) != ESP_OK || count == 0) {
+                s_dev_seen_us = 0;
+                return NULL;
+            }
+        }
+        ESP_LOGI(TAG, "starting ID; scan %lld ms after the USB device was seen",
+                 (long long)((esp_timer_get_time() - s_dev_seen_us) / 1000));
     }
     uint8_t opened = 0;
     diag_counts((uint8_t)count, 0, 0);
@@ -855,6 +996,7 @@ static cdc_acm_dev_hdl_t find_cat_port(void)
         }
         diag_counts((uint8_t)count, opened, 0);
     }
+    s_tried_ports = count > 0;
     return NULL;
 }
 
@@ -871,7 +1013,7 @@ static void cat_task(void *arg)
             cdc_acm_host_close(dev);
             publish(false, 0, 0, 0, 0, 0, 0, "", 0, "");
         }
-        vTaskDelay(pdMS_TO_TICKS(SCAN_PERIOD_MS));
+        vTaskDelay(pdMS_TO_TICKS(s_tried_ports ? SCAN_PERIOD_FAIL_MS : SCAN_PERIOD_MS));
     }
 }
 
